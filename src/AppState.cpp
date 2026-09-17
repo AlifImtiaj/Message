@@ -2913,7 +2913,7 @@ void ReceiveTask(
         // ====================================================
 
         vTaskDelay(
-            pdMS_TO_TICKS(0)
+            pdMS_TO_TICKS(1)
         );
     }
 }
