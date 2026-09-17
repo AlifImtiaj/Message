@@ -2,6 +2,8 @@
 
 #include <LoRa.h>
 #include <LiquidCrystal_I2C.h>
+#include <LittleFS.h>
+#include <Preferences.h>
 
 #include "LoraConfig.h"
 
@@ -10,6 +12,9 @@
 
 extern LiquidCrystal_I2C display;
 
+Preferences prefs;
+
+bool isThereNewMessage = false;
 
 // ============================================================
 // APPLICATION STATE
@@ -20,31 +25,13 @@ AppState appState = AppState::MENU;
 TaskHandle_t receiveTaskHandle = NULL;
 
 SemaphoreHandle_t displayMutex = NULL;
-
-
-// ============================================================
-// RECEIVED MESSAGES
-// ============================================================
-
-String recvdMessages[5];
-
-int recvdMessageCount = 0;
-
+SemaphoreHandle_t storageMutex = NULL;
 
 // ============================================================
 // SERIAL INPUT
 // ============================================================
-//
-// This is the single input buffer used by ReadSerialLine().
-//
-// IMPORTANT:
-// There is no longer a static local String inside
-// ReadSerialLine(). This prevents an old input such as "123"
-// from surviving a notification invisibly.
-//
 
 String currentInput = "";
-
 
 // ============================================================
 // LCD INPUT CURSOR
@@ -53,7 +40,6 @@ String currentInput = "";
 int inputCol = 0;
 int inputRow = 3;
 int inputMinCol = 0;
-
 
 // ============================================================
 // MESSAGE NOTIFICATION
@@ -67,54 +53,32 @@ AppState notificationPreviousState;
 
 String notificationPreviousInput;
 
+int notificationPreviousMessagePage = 0;
+
+String notificationPreviousSelectedMessageText = "";
 
 // ============================================================
-// CHECK_MESSAGE UI
+// MESSAGE UI
 // ============================================================
 
 int checkMessagePage = 0;
 
 int selectedMessageIndex = -1;
 
+// ============================================================
+// SELECTED MESSAGE CACHE
+// ============================================================
+//
+// Only the message currently being viewed is kept in RAM.
+//
+// The complete message history remains in LittleFS.
+//
+
+String selectedMessageText = "";
 
 // ============================================================
-// CHECK_MESSAGE STATE FOR NOTIFICATION RESTORATION
+// MESSAGE SCROLLING
 // ============================================================
-
-int notificationPreviousMessagePage = 0;
-
-int notificationPreviousSelectedMessage = -1;
-
-// Save the actual message that was being viewed.
-//
-// This is important because PushRecvdMessage() inserts a new
-// message at index 0 and shifts all existing indexes.
-//
-// Example:
-//
-// Before new message:
-// index 0 = A
-// index 1 = B
-// index 2 = C
-//
-// User is viewing C (index 2).
-//
-// New message arrives:
-//
-// index 0 = NEW
-// index 1 = A
-// index 2 = B
-// index 3 = C
-//
-// Therefore restoring index 2 would incorrectly show B.
-//
-// Saving the actual message allows us to find C again.
-
-
-// this section is for scrolling the text
-String notificationPreviousSelectedMessageText = "";
-
-static uint16_t nextMessageID = 0;
 
 bool messageScrollActive = false;
 
@@ -131,19 +95,958 @@ enum class MessageScrollState
 
 MessageScrollState messageScrollState =
     MessageScrollState::WAIT_AT_START;
-// section ends
+
+// ============================================================
+// LITTLEFS MESSAGE STORAGE
+// ============================================================
+//
+// Messages are stored in chronological order:
+//
+//     oldest
+//       |
+//       v
+//     A
+//     B
+//     C
+//     D
+//       ^
+//       |
+//     newest
+//
+// But the UI presents them newest-first:
+//
+//     message index 0 -> D
+//     message index 1 -> C
+//     message index 2 -> B
+//     message index 3 -> A
+//
+// Therefore we can APPEND new messages without rewriting the
+// entire filesystem every time a message arrives.
+//
+
+static const char* MESSAGE_FILE = "/messages.dat";
+
+static const uint8_t MESSAGE_MAGIC[4] = {
+    'M',
+    'S',
+    'G',
+    '1'
+};
+
+static size_t storedMessageCount = 0;
+
+// ============================================================
+// MESSAGE ID
+// ============================================================
+
+static uint16_t nextMessageID = 0;
+
+// ============================================================
+// STORAGE HELPERS
+// ============================================================
+
+static bool StorageLock()
+{
+    if (storageMutex == NULL)
+        return false;
+
+    return xSemaphoreTake(
+               storageMutex,
+               pdMS_TO_TICKS(1000)
+           ) == pdTRUE;
+}
+
+static void StorageUnlock()
+{
+    if (storageMutex != NULL)
+    {
+        xSemaphoreGive(storageMutex);
+    }
+}
+
+// ------------------------------------------------------------
+// Write exactly all requested bytes.
+// ------------------------------------------------------------
+
+static bool WriteAll(
+    File& file,
+    const uint8_t* data,
+    size_t length
+)
+{
+    size_t written = 0;
+
+    while (written < length)
+    {
+        size_t result = file.write(
+            data + written,
+            length - written
+        );
+
+        if (result == 0)
+            return false;
+
+        written += result;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// Read exactly all requested bytes.
+// ------------------------------------------------------------
+
+static bool ReadAll(
+    File& file,
+    uint8_t* data,
+    size_t length
+)
+{
+    size_t received = 0;
+
+    while (received < length)
+    {
+        size_t result = file.read(
+            data + received,
+            length - received
+        );
+
+        if (result == 0)
+            return false;
+
+        received += result;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// Read one message record header.
+//
+// Record format:
+//
+//     4 bytes  -> "MSG1"
+//     4 bytes  -> message length
+//     N bytes  -> message data
+//
+// The uint32_t length is stored in ESP32 native
+// little-endian representation.
+//
+
+static bool ReadRecordHeader(
+    File& file,
+    uint32_t& messageLength
+)
+{
+    uint8_t header[8];
+
+    if (!ReadAll(file, header, sizeof(header)))
+        return false;
+
+    if (memcmp(
+            header,
+            MESSAGE_MAGIC,
+            4
+        ) != 0)
+    {
+        return false;
+    }
+
+    memcpy(
+        &messageLength,
+        header + 4,
+        sizeof(uint32_t)
+    );
+
+    size_t remaining =
+        file.size() - file.position();
+
+    if (messageLength > remaining)
+        return false;
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// Skip a number of bytes safely.
+//
+
+static bool SkipBytes(
+    File& file,
+    uint32_t length
+)
+{
+    uint8_t buffer[128];
+
+    uint32_t remaining = length;
+
+    while (remaining > 0)
+    {
+        size_t chunk =
+            (remaining > sizeof(buffer))
+                ? sizeof(buffer)
+                : remaining;
+
+        if (!ReadAll(
+                file,
+                buffer,
+                chunk
+            ))
+        {
+            return false;
+        }
+
+        remaining -= chunk;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// Read message contents from the current file position.
+//
+
+static bool ReadMessageData(
+    File& file,
+    uint32_t length,
+    String& message
+)
+{
+    message = "";
+
+    if (length == 0)
+        return true;
+
+    message.reserve(length);
+
+    char buffer[128];
+
+    uint32_t remaining = length;
+
+    while (remaining > 0)
+    {
+        size_t chunk =
+            (remaining > sizeof(buffer))
+                ? sizeof(buffer)
+                : remaining;
+
+        size_t received =
+            file.read(
+                reinterpret_cast<uint8_t*>(buffer),
+                chunk
+            );
+
+        if (received == 0)
+            return false;
+
+        for (size_t i = 0; i < received; i++)
+        {
+            message += buffer[i];
+        }
+
+        remaining -= received;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// Scan the entire message file.
+//
+// This validates the complete file and counts its records.
+//
+
+static bool ScanMessageFile(
+    size_t& count
+)
+{
+    count = 0;
+
+    if (!LittleFS.exists(MESSAGE_FILE))
+        return true;
+
+    File file = LittleFS.open(
+        MESSAGE_FILE,
+        "r"
+    );
+
+    if (!file)
+        return false;
+
+    while (file.position() < file.size())
+    {
+        uint32_t messageLength = 0;
+
+        if (!ReadRecordHeader(
+                file,
+                messageLength
+            ))
+        {
+            file.close();
+            return false;
+        }
+
+        if (!SkipBytes(
+                file,
+                messageLength
+            ))
+        {
+            file.close();
+            return false;
+        }
+
+        count++;
+    }
+
+    file.close();
+
+    return true;
+}
+
+// ============================================================
+// INITIALIZE LITTLEFS
+// ============================================================
+
+bool InitializeMessageStorage()
+{
+    if (storageMutex == NULL)
+    {
+        storageMutex =
+            xSemaphoreCreateMutex();
+
+        if (storageMutex == NULL)
+        {
+            return false;
+        }
+    }
+
+    if (!LittleFS.begin(false, "/littlefs", 10, "littlefs"))
+    {
+        Serial.println(
+            "ERROR: LittleFS mount failed."
+        );
+
+        return false;
+    }
+
+    if (!LittleFS.exists(MESSAGE_FILE))
+    {
+        File file = LittleFS.open(
+            MESSAGE_FILE,
+            "w"
+        );
+
+        if (!file)
+        {
+            Serial.println(
+                "ERROR: Cannot create message file."
+            );
+
+            return false;
+        }
+
+        file.close();
+
+        storedMessageCount = 0;
+
+        Serial.println(
+            "LittleFS message storage created."
+        );
+
+        return true;
+    }
+
+    size_t count = 0;
+
+    if (!ScanMessageFile(count))
+    {
+        Serial.println(
+            "ERROR: Message file is corrupted."
+        );
+
+        return false;
+    }
+
+    storedMessageCount = count;
+
+    Serial.print(
+        "LittleFS messages: "
+    );
+
+    Serial.println(
+        storedMessageCount
+    );
+
+    return true;
+}
+
+// ============================================================
+// GET MESSAGE COUNT
+// ============================================================
+
+size_t GetStoredMessageCount()
+{
+    if (!StorageLock())
+        return 0;
+
+    size_t count =
+        storedMessageCount;
+
+    StorageUnlock();
+
+    return count;
+}
+
+// ============================================================
+// SAVE RECEIVED MESSAGE
+// ============================================================
+//
+// New messages are APPENDED.
+//
+// This means receiving a message does not require rewriting
+// the complete message database.
+//
+
+bool SaveReceivedMessage(
+    const String& message
+)
+{
+    if (!StorageLock())
+        return false;
+
+    File file = LittleFS.open(
+        MESSAGE_FILE,
+        "a"
+    );
+
+    if (!file)
+    {
+        StorageUnlock();
+        return false;
+    }
+
+    uint32_t messageLength =
+        static_cast<uint32_t>(
+            message.length()
+        );
+
+    bool success = true;
+
+    // Write magic.
+    if (!WriteAll(
+            file,
+            MESSAGE_MAGIC,
+            sizeof(MESSAGE_MAGIC)
+        ))
+    {
+        success = false;
+    }
+
+    // Write message length.
+    if (success)
+    {
+        if (!WriteAll(
+                file,
+                reinterpret_cast<const uint8_t*>(
+                    &messageLength
+                ),
+                sizeof(messageLength)
+            ))
+        {
+            success = false;
+        }
+    }
+
+    // Write message contents.
+    if (success && messageLength > 0)
+    {
+        if (!WriteAll(
+                file,
+                reinterpret_cast<const uint8_t*>(
+                    message.c_str()
+                ),
+                messageLength
+            ))
+        {
+            success = false;
+        }
+    }
+
+    file.close();
+
+    if (success)
+    {
+        storedMessageCount++;
+
+        Serial.print(
+            "Message saved. Total messages: "
+        );
+
+        Serial.println(
+            storedMessageCount
+        );
+    }
+
+    StorageUnlock();
+
+    return success;
+}
+
+// ============================================================
+// READ STORED MESSAGE
+// ============================================================
+//
+// messageIndex is the UI index:
+//
+//     0 = newest
+//     1 = second newest
+//     2 = third newest
+//     ...
+//
+// The physical file is stored oldest -> newest, so the
+// physical index is calculated accordingly.
+//
+
+bool ReadStoredMessage(
+    size_t messageIndex,
+    String& message
+)
+{
+    message = "";
+
+    if (!StorageLock())
+        return false;
+
+    if (messageIndex >= storedMessageCount)
+    {
+        StorageUnlock();
+        return false;
+    }
+
+    File file = LittleFS.open(
+        MESSAGE_FILE,
+        "r"
+    );
+
+    if (!file)
+    {
+        StorageUnlock();
+        return false;
+    }
+
+    size_t physicalIndex =
+        storedMessageCount -
+        1 -
+        messageIndex;
+
+    bool success = false;
+
+    for (size_t i = 0;
+         i < storedMessageCount;
+         i++)
+    {
+        uint32_t messageLength = 0;
+
+        if (!ReadRecordHeader(
+                file,
+                messageLength
+            ))
+        {
+            break;
+        }
+
+        if (i == physicalIndex)
+        {
+            success =
+                ReadMessageData(
+                    file,
+                    messageLength,
+                    message
+                );
+
+            break;
+        }
+
+        if (!SkipBytes(
+                file,
+                messageLength
+            ))
+        {
+            break;
+        }
+    }
+
+    file.close();
+
+    StorageUnlock();
+
+    return success;
+}
+
+// ============================================================
+// FIND MESSAGE
+// ============================================================
+//
+// Used when restoring a message after the temporary
+// "Message Received" notification.
+//
+// Search is newest-first, matching the UI ordering.
+//
+
+int FindStoredMessage(
+    const String& target
+)
+{
+    if (!StorageLock())
+        return -1;
+
+    File file = LittleFS.open(
+        MESSAGE_FILE,
+        "r"
+    );
+
+    if (!file)
+    {
+        StorageUnlock();
+        return -1;
+    }
+
+    int result = -1;
+
+    for (size_t physicalIndex = 0;
+         physicalIndex < storedMessageCount;
+         physicalIndex++)
+    {
+        uint32_t messageLength = 0;
+
+        if (!ReadRecordHeader(
+                file,
+                messageLength
+            ))
+        {
+            break;
+        }
+
+        String message;
+
+        if (!ReadMessageData(
+                file,
+                messageLength,
+                message
+            ))
+        {
+            break;
+        }
+
+        if (message == target)
+        {
+            // Convert physical index into newest-first
+            // logical index.
+            result =
+                static_cast<int>(
+                    storedMessageCount -
+                    1 -
+                    physicalIndex
+                );
+
+            break;
+        }
+    }
+
+    file.close();
+
+    StorageUnlock();
+
+    return result;
+}
+
+// ============================================================
+// DELETE STORED MESSAGE
+// ============================================================
+//
+// Deletes a logical UI index.
+//
+// Example:
+//
+// UI:
+//     0 = E
+//     1 = D
+//     2 = C
+//     3 = B
+//     4 = A
+//
+// Delete index 2:
+//
+// Result:
+//     0 = E
+//     1 = D
+//     2 = B
+//     3 = A
+//
+// No gaps remain.
+//
+
+bool DeleteStoredMessage(
+    size_t messageIndex
+)
+{
+    if (!StorageLock())
+        return false;
+
+    if (messageIndex >= storedMessageCount)
+    {
+        StorageUnlock();
+        return false;
+    }
+
+    File source = LittleFS.open(
+        MESSAGE_FILE,
+        "r"
+    );
+
+    if (!source)
+    {
+        StorageUnlock();
+        return false;
+    }
+
+    const char* tempFileName =
+        "/messages.tmp";
+
+    const char* backupFileName =
+        "/messages.bak";
+
+    // // Remove leftovers from a previous failed operation.
+    // if (LittleFS.exists(tempFileName))
+    //     LittleFS.remove(tempFileName);
+
+    // if (LittleFS.exists(backupFileName))
+    //     LittleFS.remove(backupFileName);
+
+    File temp = LittleFS.open(
+        tempFileName,
+        "w"
+    );
+
+    if (!temp)
+    {
+        source.close();
+        StorageUnlock();
+        return false;
+    }
+
+    size_t physicalDeleteIndex =
+        storedMessageCount -
+        1 -
+        messageIndex;
+
+    bool success = true;
+
+    for (size_t physicalIndex = 0;
+         physicalIndex < storedMessageCount;
+         physicalIndex++)
+    {
+        uint8_t header[8];
+
+        if (!ReadAll(
+                source,
+                header,
+                sizeof(header)
+            ))
+        {
+            success = false;
+            break;
+        }
+
+        if (memcmp(
+                header,
+                MESSAGE_MAGIC,
+                4
+            ) != 0)
+        {
+            success = false;
+            break;
+        }
+
+        uint32_t messageLength = 0;
+
+        memcpy(
+            &messageLength,
+            header + 4,
+            sizeof(messageLength)
+        );
+
+        size_t remaining =
+            source.size() -
+            source.position();
+
+        if (messageLength > remaining)
+        {
+            success = false;
+            break;
+        }
+
+        // This is the message we are deleting.
+        if (physicalIndex ==
+            physicalDeleteIndex)
+        {
+            if (!SkipBytes(
+                    source,
+                    messageLength
+                ))
+            {
+                success = false;
+                break;
+            }
+
+            continue;
+        }
+
+        // Copy the record header.
+        if (!WriteAll(
+                temp,
+                header,
+                sizeof(header)
+            ))
+        {
+            success = false;
+            break;
+        }
+
+        // Copy the message contents.
+        uint8_t buffer[128];
+
+        uint32_t bytesRemaining =
+            messageLength;
+
+        while (bytesRemaining > 0)
+        {
+            size_t chunk =
+                (bytesRemaining > sizeof(buffer))
+                    ? sizeof(buffer)
+                    : bytesRemaining;
+
+            if (!ReadAll(
+                    source,
+                    buffer,
+                    chunk
+                ))
+            {
+                success = false;
+                break;
+            }
+
+            if (!WriteAll(
+                    temp,
+                    buffer,
+                    chunk
+                ))
+            {
+                success = false;
+                break;
+            }
+
+            bytesRemaining -= chunk;
+        }
+
+        if (!success)
+            break;
+    }
+
+    source.close();
+    temp.close();
+
+    if (!success)
+    {
+        LittleFS.remove(tempFileName);
+        StorageUnlock();
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // Replace original file safely.
+    //
+    // Original:
+    //     messages.dat
+    //
+    // Temporary:
+    //     messages.tmp
+    //
+    // Backup:
+    //     messages.bak
+    // --------------------------------------------------------
+
+    if (!LittleFS.rename(
+            MESSAGE_FILE,
+            backupFileName
+        ))
+    {
+        LittleFS.remove(tempFileName);
+        StorageUnlock();
+        return false;
+    }
+
+    if (!LittleFS.rename(
+            tempFileName,
+            MESSAGE_FILE
+        ))
+    {
+        // Try to restore original.
+        LittleFS.rename(
+            backupFileName,
+            MESSAGE_FILE
+        );
+
+        LittleFS.remove(tempFileName);
+
+        StorageUnlock();
+        return false;
+    }
+
+    // New file is now active.
+    LittleFS.remove(backupFileName);
+
+    storedMessageCount--;
+
+    Serial.print(
+        "Message deleted. Total messages: "
+    );
+
+    Serial.println(
+        storedMessageCount
+    );
+
+    StorageUnlock();
+
+    return true;
+}
+
+// ============================================================
+// MESSAGE ID
+// ============================================================
+
+uint16_t AllocateMessageID()
+{
+    uint16_t id = nextMessageID;
+
+    nextMessageID++;
+
+    return id;
+}
 
 // ============================================================
 // INPUT POSITION
 // ============================================================
 
-void SetInputPosition(int col, int row)
+void SetInputPosition(
+    int col,
+    int row
+)
 {
     inputCol = col;
     inputMinCol = col;
     inputRow = row;
 }
-
 
 // ============================================================
 // START MESSAGE NOTIFICATION
@@ -158,61 +1061,45 @@ void StartMessageNotification()
 
     messageNotificationStart = millis();
 
-    // Save application state.
-    notificationPreviousState = appState;
+    // Save current application state.
+    notificationPreviousState =
+        appState;
 
     // Save current input.
-    //
-    // We save it here so SEND_MESSAGE can restore the message
-    // being typed if a notification interrupts it.
-    notificationPreviousInput = currentInput;
+    notificationPreviousInput =
+        currentInput;
 
-    // Save CHECK_MESSAGE UI state.
-    notificationPreviousMessagePage = checkMessagePage;
-    notificationPreviousSelectedMessage = selectedMessageIndex;
+    // Save message page.
+    notificationPreviousMessagePage =
+        checkMessagePage;
 
     // Save the actual selected message.
-    notificationPreviousSelectedMessageText = "";
+    notificationPreviousSelectedMessageText =
+        "";
 
-    if (appState == AppState::CHECK_MESSAGE &&
-        selectedMessageIndex >= 0 &&
-        selectedMessageIndex < recvdMessageCount)
+    if (appState ==
+            AppState::CHECK_MESSAGE &&
+        selectedMessageIndex >= 0)
     {
         notificationPreviousSelectedMessageText =
-            recvdMessages[selectedMessageIndex];
+            selectedMessageText;
     }
 
     // --------------------------------------------------------
-    // IMPORTANT:
+    // MENU / CHECK_MESSAGE / CONFIGURE
     //
-    // A notification interrupts an unfinished OPTION command.
+    // Discard unfinished command.
     //
-    // If the user typed:
-    //
-    //     123
-    //
-    // and then a message arrived, we do NOT want the hidden
-    // serial buffer to remain "123" while the LCD later shows:
-    //
-    //     Option:
-    //
-    // Otherwise typing 0 would produce:
-    //
-    //     1230
-    //
-    // So for MENU / CHECK_MESSAGE / CONFIGURE we discard the
-    // unfinished command.
-    //
-    // SEND_MESSAGE is different: there the input itself is the
-    // message being composed, so we preserve it.
+    // SEND_MESSAGE is different:
+    // preserve the message currently being typed.
     // --------------------------------------------------------
 
-    if (appState != AppState::SEND_MESSAGE)
+    if (appState !=
+        AppState::SEND_MESSAGE)
     {
         currentInput = "";
     }
 
-    // Show notification.
     LcdPrint(
         0,
         0,
@@ -220,7 +1107,6 @@ void StartMessageNotification()
         true
     );
 }
-
 
 // ============================================================
 // RESTORE PREVIOUS SCREEN
@@ -238,15 +1124,10 @@ void RestorePreviousScreen()
         {
             ShowMenu();
 
-            // MENU command input was intentionally discarded
-            // when notification started, so the restored menu
-            // starts with an empty Option field.
-
             currentInput = "";
 
             break;
         }
-
 
         // ----------------------------------------------------
         // SEND MESSAGE
@@ -266,23 +1147,29 @@ void RestorePreviousScreen()
                 1
             );
 
-            // Restore the actual message being typed.
-            currentInput = notificationPreviousInput;
+            currentInput =
+                notificationPreviousInput;
 
-            int len = currentInput.length();
+            int len =
+                currentInput.length();
 
             if (len < COL)
             {
-                SetInputPosition(len, 1);
+                SetInputPosition(
+                    len,
+                    1
+                );
             }
             else
             {
-                SetInputPosition(COL, 1);
+                SetInputPosition(
+                    COL,
+                    1
+                );
             }
 
             break;
         }
-
 
         // ----------------------------------------------------
         // CHECK MESSAGE
@@ -290,62 +1177,45 @@ void RestorePreviousScreen()
 
         case AppState::CHECK_MESSAGE:
         {
-            checkMessagePage = notificationPreviousMessagePage;
 
-            // ------------------------------------------------
-            // User was viewing a specific message.
-            // ------------------------------------------------
+            checkMessagePage =
+                notificationPreviousMessagePage;
 
-            if (notificationPreviousSelectedMessageText.length() > 0)
+            // User was viewing a message.
+            if (notificationPreviousSelectedMessageText.length() >
+                0)
             {
-                int restoredIndex = -1;
-
-                // Search for the actual message after the new
-                // message has shifted the array.
-                for (int i = 0; i < recvdMessageCount; i++)
-                {
-                    if (recvdMessages[i] ==
-                        notificationPreviousSelectedMessageText)
-                    {
-                        restoredIndex = i;
-                        break;
-                    }
-                }
+                int restoredIndex =
+                    FindStoredMessage(
+                        notificationPreviousSelectedMessageText
+                    );
 
                 if (restoredIndex >= 0)
                 {
-                    selectedMessageIndex = restoredIndex;
-
                     ShowSelectedMessage(
-                        selectedMessageIndex
+                        restoredIndex
                     );
                 }
                 else
                 {
-                    // The old message is no longer stored.
                     selectedMessageIndex = -1;
+                    selectedMessageText = "";
 
                     ShowMessagePage();
                 }
             }
-
-            // ------------------------------------------------
-            // User was on the message list.
-            // ------------------------------------------------
-
             else
             {
                 selectedMessageIndex = -1;
+                selectedMessageText = "";
 
                 ShowMessagePage();
             }
 
-            // CHECK_MESSAGE command input is reset.
             currentInput = "";
 
             break;
         }
-
 
         // ----------------------------------------------------
         // CONFIGURE
@@ -366,7 +1236,10 @@ void RestorePreviousScreen()
                 "Check Serial Monitor"
             );
 
-            SetInputPosition(0, 2);
+            SetInputPosition(
+                0,
+                2
+            );
 
             currentInput = "";
 
@@ -374,7 +1247,6 @@ void RestorePreviousScreen()
         }
     }
 }
-
 
 // ============================================================
 // UPDATE MESSAGE NOTIFICATION
@@ -385,14 +1257,15 @@ void UpdateMessageNotification()
     if (!messageNotificationActive)
         return;
 
-    if (millis() - messageNotificationStart >= 2000)
+    if (millis() -
+            messageNotificationStart >=
+        2000)
     {
         messageNotificationActive = false;
 
         RestorePreviousScreen();
     }
 }
-
 
 // ============================================================
 // LCD PRINT
@@ -405,6 +1278,9 @@ void LcdPrint(
     bool clearFirst
 )
 {
+    if (displayMutex == NULL)
+        return;
+
     if (xSemaphoreTake(
             displayMutex,
             pdMS_TO_TICKS(100)
@@ -413,32 +1289,29 @@ void LcdPrint(
         if (clearFirst)
             display.clear();
 
-        display.setCursor(col, row);
+        display.setCursor(
+            col,
+            row
+        );
 
         display.print(text);
 
-        xSemaphoreGive(displayMutex);
+        xSemaphoreGive(
+            displayMutex
+        );
     }
 }
-
 
 // ============================================================
 // LCD ECHO CHARACTER
 // ============================================================
-//
-// This function only handles the LCD.
-//
-// The actual serial input buffer is maintained by
-// ReadSerialLine().
-//
-// Keeping those responsibilities separate prevents the old
-// double-buffer problem.
-//
 
 void LcdEchoChar(char c)
 {
-    // Notification screen must not be overwritten.
     if (messageNotificationActive)
+        return;
+
+    if (displayMutex == NULL)
         return;
 
     if (xSemaphoreTake(
@@ -480,10 +1353,11 @@ void LcdEchoChar(char c)
             }
         }
 
-        xSemaphoreGive(displayMutex);
+        xSemaphoreGive(
+            displayMutex
+        );
     }
 }
-
 
 // ============================================================
 // SCROLLING INPUT
@@ -494,17 +1368,24 @@ void RedrawScrollingInput(
     int row
 )
 {
+    if (displayMutex == NULL)
+        return;
+
     if (xSemaphoreTake(
             displayMutex,
             pdMS_TO_TICKS(100)
         ) == pdTRUE)
     {
-        display.setCursor(0, row);
+        display.setCursor(
+            0,
+            row
+        );
 
         for (int i = 0; i < COL; i++)
             display.print(' ');
 
-        int len = text.length();
+        int len =
+            text.length();
 
         int start =
             (len > COL)
@@ -512,16 +1393,25 @@ void RedrawScrollingInput(
                 : 0;
 
         String visible =
-            text.substring(start, len);
+            text.substring(
+                start,
+                len
+            );
 
-        display.setCursor(0, row);
+        display.setCursor(
+            0,
+            row
+        );
 
-        display.print(visible);
+        display.print(
+            visible
+        );
 
-        xSemaphoreGive(displayMutex);
+        xSemaphoreGive(
+            displayMutex
+        );
     }
 }
-
 
 // ============================================================
 // MAIN MENU
@@ -529,6 +1419,9 @@ void RedrawScrollingInput(
 
 void ShowMenu()
 {
+    if (displayMutex == NULL)
+        return;
+
     if (xSemaphoreTake(
             displayMutex,
             pdMS_TO_TICKS(100)
@@ -536,71 +1429,81 @@ void ShowMenu()
     {
         display.clear();
 
-        display.setCursor(0, 0);
-        display.print("1. Check Message");
+        display.setCursor(
+            0,
+            0
+        );
 
-        display.setCursor(0, 1);
-        display.print("2. Send Message");
+        display.print(
+            "1. Check Message"
+        );
 
-        display.setCursor(0, 2);
-        display.print("3. Configure");
+        display.setCursor(
+            0,
+            1
+        );
 
-        display.setCursor(0, 3);
-        display.print("Option: ");
+        display.print(
+            "2. Send Message"
+        );
 
-        xSemaphoreGive(displayMutex);
+        display.setCursor(
+            0,
+            2
+        );
+
+        display.print(
+            "3. Configure"
+        );
+
+        display.setCursor(
+            0,
+            3
+        );
+
+        display.print(
+            "Option: "
+        );
+
+        xSemaphoreGive(
+            displayMutex
+        );
     }
 
-    SetInputPosition(8, 3);
+    SetInputPosition(
+        8,
+        3
+    );
 }
-
 
 // ============================================================
 // MESSAGE PREVIEW
 // ============================================================
 
-String GetMessagePreview(const String& message)
+static String GetMessagePreview(
+    const String& message
+)
 {
     if (message.length() <= 14)
         return message;
 
-    return message.substring(0, 14) + "...";
+    return message.substring(
+               0,
+               14
+           ) +
+           "...";
 }
-
 
 // ============================================================
 // SHOW MESSAGE PAGE
 // ============================================================
-//
-// IMPORTANT:
-//
-// The displayed numbers are ALWAYS:
-//
-//     1.
-//     2.
-//
-// They are page-local numbers.
-//
-// Internally:
-//
-// page 0:
-//     1 -> message index 0
-//     2 -> message index 1
-//
-// page 1:
-//     1 -> message index 2
-//     2 -> message index 3
-//
-// page 2:
-//     1 -> message index 4
-//
-// This means you can later expand the storage without having
-// to create options 3, 4, 5, 6, etc.
-//
 
 void ShowMessagePage()
 {
-    if (recvdMessageCount <= 0)
+    size_t messageCount =
+        GetStoredMessageCount();
+
+    if (messageCount == 0)
     {
         LcdPrint(
             0,
@@ -621,23 +1524,64 @@ void ShowMessagePage()
             "Option: "
         );
 
-        SetInputPosition(8, 3);
+        SetInputPosition(
+            8,
+            3
+        );
 
         return;
     }
 
-    const int messagesPerPage = 2;
+    const size_t messagesPerPage = 2;
 
-    int startIndex =
-        checkMessagePage * messagesPerPage;
+    size_t startIndex =
+        static_cast<size_t>(
+            checkMessagePage
+        ) *
+        messagesPerPage;
 
     // Safety check.
-    if (startIndex >= recvdMessageCount)
+    if (startIndex >= messageCount)
     {
-        checkMessagePage = 0;
+        size_t lastPage =
+            (messageCount - 1) /
+            messagesPerPage;
 
-        startIndex = 0;
+        checkMessagePage =
+            static_cast<int>(
+                lastPage
+            );
+
+        startIndex =
+            static_cast<size_t>(
+                checkMessagePage
+            ) *
+            messagesPerPage;
     }
+
+    String message1;
+    String message2;
+
+    bool hasMessage1 =
+        ReadStoredMessage(
+            startIndex,
+            message1
+        );
+
+    bool hasMessage2 = false;
+
+    if (startIndex + 1 <
+        messageCount)
+    {
+        hasMessage2 =
+            ReadStoredMessage(
+                startIndex + 1,
+                message2
+            );
+    }
+
+    if (displayMutex == NULL)
+        return;
 
     if (xSemaphoreTake(
             displayMutex,
@@ -646,71 +1590,103 @@ void ShowMessagePage()
     {
         display.clear();
 
-
         // ----------------------------------------------------
         // Message 1
         // ----------------------------------------------------
 
-        if (startIndex < recvdMessageCount)
+        if (hasMessage1)
         {
-            display.setCursor(0, 0);
+            display.setCursor(
+                0,
+                0
+            );
 
-            display.print("1. ");
+            display.print(
+                "1. "
+            );
 
             display.print(
                 GetMessagePreview(
-                    recvdMessages[startIndex]
+                    message1
                 )
             );
         }
-
 
         // ----------------------------------------------------
         // Message 2
         // ----------------------------------------------------
 
-        if (startIndex + 1 < recvdMessageCount)
+        if (hasMessage2)
         {
-            display.setCursor(0, 1);
+            display.setCursor(
+                0,
+                1
+            );
 
-            display.print("2. ");
+            display.print(
+                "2. "
+            );
 
             display.print(
                 GetMessagePreview(
-                    recvdMessages[startIndex + 1]
+                    message2
                 )
             );
         }
-
 
         // ----------------------------------------------------
         // Navigation
         // ----------------------------------------------------
 
-        display.setCursor(0, 2);
+        display.setCursor(
+            0,
+            2
+        );
 
         display.print(
             "0.Ex 00.Nxt 000.Bck"
         );
 
-
         // ----------------------------------------------------
         // Input
         // ----------------------------------------------------
 
-        display.setCursor(0, 3);
+        display.setCursor(
+            0,
+            3
+        );
 
-        display.print("Option: ");
+        display.print(
+            "Option: "
+        );
 
-        xSemaphoreGive(displayMutex);
+        xSemaphoreGive(
+            displayMutex
+        );
     }
 
-    SetInputPosition(8, 3);
+    SetInputPosition(
+        8,
+        3
+    );
 }
 
 // ============================================================
 // RESET MESSAGE SCROLL
 // ============================================================
+
+void ResetMessageScroll()
+{
+    messageScrollActive = false;
+
+    messageScrollPosition = 0;
+
+    messageScrollTimer =
+        millis();
+
+    messageScrollState =
+        MessageScrollState::WAIT_AT_START;
+}
 
 // ============================================================
 // UPDATE MESSAGE SCROLL
@@ -721,42 +1697,34 @@ void UpdateMessageScroll()
     if (!messageScrollActive)
         return;
 
-    if (selectedMessageIndex < 0 ||
-        selectedMessageIndex >= recvdMessageCount)
+    if (selectedMessageIndex < 0)
+        return;
+
+    if (selectedMessageText.length() <= COL)
     {
         ResetMessageScroll();
         return;
     }
 
-    String message =
-        recvdMessages[selectedMessageIndex];
-
-    // Safety check.
-    if (message.length() <= COL)
-    {
-        ResetMessageScroll();
-        return;
-    }
-
-    unsigned long now = millis();
+    unsigned long now =
+        millis();
 
     // ========================================================
     // WAIT AT START
-    //
-    // Message is initially displayed from character 0.
-    //
-    // Wait exactly 1 second before moving.
     // ========================================================
 
     if (messageScrollState ==
         MessageScrollState::WAIT_AT_START)
     {
-        if (now - messageScrollTimer >= 1000)
+        if (now -
+                messageScrollTimer >=
+            1000)
         {
             messageScrollState =
                 MessageScrollState::SCROLLING;
 
-            messageScrollTimer = now;
+            messageScrollTimer =
+                now;
         }
 
         return;
@@ -764,64 +1732,79 @@ void UpdateMessageScroll()
 
     // ========================================================
     // SCROLLING
-    //
-    // Move one character every 250 ms.
     // ========================================================
 
     if (messageScrollState ==
         MessageScrollState::SCROLLING)
     {
-        if (now - messageScrollTimer >= 250)
+        if (now -
+                messageScrollTimer >=
+            250)
         {
-            messageScrollTimer = now;
+            messageScrollTimer =
+                now;
 
             int maxPosition =
-                message.length() - COL;
+                selectedMessageText.length() -
+                COL;
 
             messageScrollPosition++;
 
             // ------------------------------------------------
-            // Reached the final 20-character window.
+            // Reached final 20-character window.
             // ------------------------------------------------
 
-            if (messageScrollPosition >= maxPosition)
+            if (messageScrollPosition >=
+                maxPosition)
             {
-                messageScrollPosition = maxPosition;
+                messageScrollPosition =
+                    maxPosition;
 
-                // Display final position.
                 if (xSemaphoreTake(
                         displayMutex,
                         pdMS_TO_TICKS(100)
                     ) == pdTRUE)
                 {
-                    display.setCursor(0, 1);
+                    display.setCursor(
+                        0,
+                        1
+                    );
 
-                    for (int i = 0; i < COL; i++)
+                    for (int i = 0;
+                         i < COL;
+                         i++)
+                    {
                         display.print(' ');
+                    }
 
-                    display.setCursor(0, 1);
+                    display.setCursor(
+                        0,
+                        1
+                    );
 
                     display.print(
-                        message.substring(
+                        selectedMessageText.substring(
                             messageScrollPosition,
                             messageScrollPosition + COL
                         )
                     );
 
-                    xSemaphoreGive(displayMutex);
+                    xSemaphoreGive(
+                        displayMutex
+                    );
                 }
 
-                // Start 1-second wait at the end.
                 messageScrollState =
                     MessageScrollState::WAIT_AT_END;
 
-                messageScrollTimer = now;
+                messageScrollTimer =
+                    now;
 
                 return;
             }
 
             // ------------------------------------------------
-            // Display the next scrolling position.
+            // Display next scrolling position.
             // ------------------------------------------------
 
             if (xSemaphoreTake(
@@ -829,21 +1812,33 @@ void UpdateMessageScroll()
                     pdMS_TO_TICKS(100)
                 ) == pdTRUE)
             {
-                display.setCursor(0, 1);
+                display.setCursor(
+                    0,
+                    1
+                );
 
-                for (int i = 0; i < COL; i++)
+                for (int i = 0;
+                     i < COL;
+                     i++)
+                {
                     display.print(' ');
+                }
 
-                display.setCursor(0, 1);
+                display.setCursor(
+                    0,
+                    1
+                );
 
                 display.print(
-                    message.substring(
+                    selectedMessageText.substring(
                         messageScrollPosition,
                         messageScrollPosition + COL
                     )
                 );
 
-                xSemaphoreGive(displayMutex);
+                xSemaphoreGive(
+                    displayMutex
+                );
             }
         }
 
@@ -852,93 +1847,113 @@ void UpdateMessageScroll()
 
     // ========================================================
     // WAIT AT END
-    //
-    // Final 20 characters stay on screen for 1 second.
-    //
-    // Then return to position 0 and wait another 1 second.
     // ========================================================
 
     if (messageScrollState ==
         MessageScrollState::WAIT_AT_END)
     {
-        if (now - messageScrollTimer >= 1000)
+        if (now -
+                messageScrollTimer >=
+            1000)
         {
-            messageScrollPosition = 0;
+            messageScrollPosition =
+                0;
 
             if (xSemaphoreTake(
                     displayMutex,
                     pdMS_TO_TICKS(100)
                 ) == pdTRUE)
             {
-                display.setCursor(0, 1);
+                display.setCursor(
+                    0,
+                    1
+                );
 
-                for (int i = 0; i < COL; i++)
+                for (int i = 0;
+                     i < COL;
+                     i++)
+                {
                     display.print(' ');
+                }
 
-                display.setCursor(0, 1);
+                display.setCursor(
+                    0,
+                    1
+                );
 
                 display.print(
-                    message.substring(
+                    selectedMessageText.substring(
                         0,
                         COL
                     )
                 );
 
-                xSemaphoreGive(displayMutex);
+                xSemaphoreGive(
+                    displayMutex
+                );
             }
-
-            // ------------------------------------------------
-            // IMPORTANT:
-            //
-            // We are back at the beginning.
-            // Wait another full 1 second before scrolling.
-            // ------------------------------------------------
 
             messageScrollState =
                 MessageScrollState::WAIT_AT_START;
 
-            messageScrollTimer = now;
+            messageScrollTimer =
+                now;
         }
     }
-}
-
-void ResetMessageScroll()
-{
-    messageScrollActive = false;
-    messageScrollPosition = 0;
-    messageScrollTimer = millis();
-
-    messageScrollState =
-        MessageScrollState::WAIT_AT_START;
 }
 
 // ============================================================
 // SHOW SELECTED MESSAGE
 // ============================================================
 
-void ShowSelectedMessage(int messageIndex)
+void ShowSelectedMessage(
+    int messageIndex
+)
 {
-    if (messageIndex < 0 ||
-        messageIndex >= recvdMessageCount)
+    String message;
+
+    if (!ReadStoredMessage(
+            static_cast<size_t>(
+                messageIndex
+            ),
+            message
+        ))
     {
+        selectedMessageIndex = -1;
+        selectedMessageText = "";
+
+        LcdPrint(
+            0,
+            0,
+            "Read failed",
+            true
+        );
+
+        LcdPrint(
+            0,
+            2,
+            "0) Go Back"
+        );
+
+        LcdPrint(
+            0,
+            3,
+            "Option: "
+        );
+
+        SetInputPosition(
+            8,
+            3
+        );
+
         return;
     }
 
-    selectedMessageIndex = messageIndex;
+    selectedMessageIndex =
+        messageIndex;
 
-    // --------------------------------------------------------
-    // Reset scrolling every time the message is opened.
-    // This guarantees:
-    //
-    //     open message
-    //          ↓
-    //     start at position 0
-    //          ↓
-    //     wait 1 second
-    //          ↓
-    //     start scrolling
-    //
-    // --------------------------------------------------------
+    selectedMessageText =
+        message;
 
     ResetMessageScroll();
 
@@ -949,74 +1964,105 @@ void ShowSelectedMessage(int messageIndex)
     {
         display.clear();
 
-        display.setCursor(0, 0);
-        display.print("Displaying Message");
+        display.setCursor(
+            0,
+            0
+        );
 
-        display.setCursor(0, 1);
+        display.print(
+            "Displaying Message"
+        );
 
-        String visibleMessage =
-            recvdMessages[messageIndex].substring(
+        display.setCursor(
+            0,
+            1
+        );
+
+        display.print(
+            selectedMessageText.substring(
                 0,
                 COL
-            );
+            )
+        );
 
-        display.print(visibleMessage);
+        display.setCursor(
+            0,
+            2
+        );
 
-        display.setCursor(0, 2);
-        display.print("0) Go Back");
+        display.print(
+            "0)Back 00)Delete"
+        );
 
-        display.setCursor(0, 3);
-        display.print("Option: ");
+        display.setCursor(
+            0,
+            3
+        );
 
-        xSemaphoreGive(displayMutex);
+        display.print(
+            "Option: "
+        );
+
+        xSemaphoreGive(
+            displayMutex
+        );
     }
 
-    SetInputPosition(8, 3);
+    SetInputPosition(
+        8,
+        3
+    );
 
-    // --------------------------------------------------------
-    // Only messages longer than 20 characters need scrolling.
-    // --------------------------------------------------------
-
-    if (recvdMessages[messageIndex].length() > COL)
+    if (selectedMessageText.length() >
+        COL)
     {
         messageScrollActive = true;
-        messageScrollTimer = millis();
+
+        messageScrollTimer =
+            millis();
+
         messageScrollState =
             MessageScrollState::WAIT_AT_START;
     }
 }
 
 // ============================================================
-// NEXT PAGE?
+// NEXT MESSAGE PAGE
 // ============================================================
 
-bool HasNextMessagePage()
+static bool HasNextMessagePage()
 {
-    const int messagesPerPage = 2;
+    size_t messageCount =
+        GetStoredMessageCount();
 
-    int nextStartIndex =
-        (checkMessagePage + 1)
-        * messagesPerPage;
+    const size_t messagesPerPage = 2;
 
-    return nextStartIndex < recvdMessageCount;
+    size_t nextStartIndex =
+        static_cast<size_t>(
+            checkMessagePage + 1
+        ) *
+        messagesPerPage;
+
+    return nextStartIndex <
+           messageCount;
 }
 
-
 // ============================================================
-// PREVIOUS PAGE?
+// PREVIOUS MESSAGE PAGE
 // ============================================================
 
-bool HasPreviousMessagePage()
+static bool HasPreviousMessagePage()
 {
     return checkMessagePage > 0;
 }
-
 
 // ============================================================
 // HANDLE MENU INPUT
 // ============================================================
 
-void HandleMenuInput(const String& line)
+void HandleMenuInput(
+    const String& line
+)
 {
     switch (appState)
     {
@@ -1028,18 +2074,28 @@ void HandleMenuInput(const String& line)
         {
             if (line == "1")
             {
-                appState = AppState::CHECK_MESSAGE;
+                appState =
+                    AppState::CHECK_MESSAGE;
 
                 checkMessagePage = 0;
 
                 selectedMessageIndex = -1;
 
+                selectedMessageText = "";
+
                 ShowMessagePage();
+
+                isThereNewMessage = false;
+                prefs.begin("MsgNot", false);
+                prefs.putBool("isNewMsg", false);
+                prefs.end();
+                digitalWrite(13, LOW);
             }
 
             else if (line == "2")
             {
-                appState = AppState::SEND_MESSAGE;
+                appState =
+                    AppState::SEND_MESSAGE;
 
                 currentInput = "";
 
@@ -1050,12 +2106,16 @@ void HandleMenuInput(const String& line)
                     true
                 );
 
-                SetInputPosition(0, 1);
+                SetInputPosition(
+                    0,
+                    1
+                );
             }
 
             else if (line == "3")
             {
-                appState = AppState::CONFIGURE;
+                appState =
+                    AppState::CONFIGURE;
 
                 if (receiveTaskHandle != NULL)
                 {
@@ -1077,7 +2137,10 @@ void HandleMenuInput(const String& line)
                     "Check Serial Monitor"
                 );
 
-                SetInputPosition(0, 2);
+                SetInputPosition(
+                    0,
+                    2
+                );
 
                 ConfigureLoRa();
             }
@@ -1101,7 +2164,6 @@ void HandleMenuInput(const String& line)
             break;
         }
 
-
         // ====================================================
         // CHECK MESSAGE
         // ====================================================
@@ -1114,35 +2176,116 @@ void HandleMenuInput(const String& line)
 
             if (selectedMessageIndex >= 0)
             {
+                // --------------------------------------------
+                // 0 = Go Back
+                // --------------------------------------------
+
                 if (line == "0")
                 {
                     selectedMessageIndex = -1;
 
+                    selectedMessageText = "";
+
                     currentInput = "";
 
                     ShowMessagePage();
+
+                    break;
                 }
-                else
+
+                // --------------------------------------------
+                // 00 = DELETE
+                // --------------------------------------------
+
+                if (line == "00")
                 {
-                    LcdPrint(
-                        0,
-                        0,
-                        "Invalid option",
-                        true
-                    );
+                    int deletedIndex =
+                        selectedMessageIndex;
 
-                    delay(800);
+                    if (DeleteStoredMessage(
+                            static_cast<size_t>(
+                                deletedIndex
+                            )
+                        ))
+                    {
+                        selectedMessageIndex = -1;
 
-                    currentInput = "";
+                        selectedMessageText = "";
 
-                    ShowSelectedMessage(
-                        selectedMessageIndex
-                    );
+                        currentInput = "";
+
+                        // ------------------------------------------------
+                        // Make sure the current page still exists.
+                        // ------------------------------------------------
+
+                        size_t messageCount =
+                            GetStoredMessageCount();
+
+                        if (messageCount == 0)
+                        {
+                            checkMessagePage = 0;
+                        }
+                        else
+                        {
+                            size_t maxPage =
+                                (messageCount - 1) /
+                                2;
+
+                            if (static_cast<size_t>(
+                                    checkMessagePage
+                                ) > maxPage)
+                            {
+                                checkMessagePage =
+                                    static_cast<int>(
+                                        maxPage
+                                    );
+                            }
+                        }
+
+                        ShowMessagePage();
+                    }
+                    else
+                    {
+                        LcdPrint(
+                            0,
+                            0,
+                            "Delete failed",
+                            true
+                        );
+
+                        delay(800);
+
+                        currentInput = "";
+
+                        ShowSelectedMessage(
+                            deletedIndex
+                        );
+                    }
+
+                    break;
                 }
+
+                // --------------------------------------------
+                // INVALID OPTION WHILE VIEWING MESSAGE
+                // --------------------------------------------
+
+                LcdPrint(
+                    0,
+                    0,
+                    "Invalid option",
+                    true
+                );
+
+                delay(800);
+
+                currentInput = "";
+
+                ShowSelectedMessage(
+                    selectedMessageIndex
+                );
 
                 break;
             }
-
 
             // ------------------------------------------------
             // Message list
@@ -1152,11 +2295,14 @@ void HandleMenuInput(const String& line)
 
             if (line == "0")
             {
-                appState = AppState::MENU;
+                appState =
+                    AppState::MENU;
 
                 checkMessagePage = 0;
 
                 selectedMessageIndex = -1;
+
+                selectedMessageText = "";
 
                 currentInput = "";
 
@@ -1165,32 +2311,41 @@ void HandleMenuInput(const String& line)
                 break;
             }
 
-
             // ------------------------------------------------
             // Select message 1 or 2
             // ------------------------------------------------
 
-            if (line == "1" || line == "2")
+            if (line == "1" ||
+                line == "2")
             {
-                const int messagesPerPage = 2;
+                const size_t messagesPerPage = 2;
 
                 int messageNumber =
                     (line == "1")
                         ? 1
                         : 2;
 
-                int messageIndex =
-                    (checkMessagePage
-                     * messagesPerPage)
-                    + (messageNumber - 1);
+                size_t messageIndex =
+                    static_cast<size_t>(
+                        checkMessagePage
+                    ) *
+                    messagesPerPage +
+                    static_cast<size_t>(
+                        messageNumber - 1
+                    );
 
-                if (messageIndex >= 0 &&
-                    messageIndex < recvdMessageCount)
+                size_t messageCount =
+                    GetStoredMessageCount();
+
+                if (messageIndex <
+                    messageCount)
                 {
                     currentInput = "";
 
                     ShowSelectedMessage(
-                        messageIndex
+                        static_cast<int>(
+                            messageIndex
+                        )
                     );
                 }
                 else
@@ -1211,7 +2366,6 @@ void HandleMenuInput(const String& line)
 
                 break;
             }
-
 
             // ------------------------------------------------
             // 00 = NEXT
@@ -1246,7 +2400,6 @@ void HandleMenuInput(const String& line)
                 break;
             }
 
-
             // ------------------------------------------------
             // 000 = PREVIOUS
             // ------------------------------------------------
@@ -1280,7 +2433,6 @@ void HandleMenuInput(const String& line)
                 break;
             }
 
-
             // ------------------------------------------------
             // INVALID
             // ------------------------------------------------
@@ -1301,7 +2453,6 @@ void HandleMenuInput(const String& line)
             break;
         }
 
-
         // ====================================================
         // SEND MESSAGE
         // ====================================================
@@ -1309,18 +2460,34 @@ void HandleMenuInput(const String& line)
         case AppState::SEND_MESSAGE:
         {
             const int chunkSize =
-                sizeof(((LoRaPacket*)0)->payload);
+                sizeof(
+                    ((LoRaPacket*)0)->payload
+                );
 
-            int totalLen = line.length();
+            int totalLen =
+                line.length();
 
             uint16_t totalPackets =
-                (totalLen + chunkSize - 1)
-                / chunkSize;
-            uint16_t messageID = messageID++;
+                (totalLen +
+                 chunkSize -
+                 1) /
+                chunkSize;
 
             if (totalPackets == 0)
                 totalPackets = 1;
 
+            // ------------------------------------------------
+            // FIX:
+            //
+            // The old code had:
+            //
+            // uint16_t messageID = messageID++;
+            //
+            // which was incorrect.
+            // ------------------------------------------------
+
+            uint16_t messageID =
+                AllocateMessageID();
 
             if (receiveTaskHandle != NULL)
             {
@@ -1328,7 +2495,6 @@ void HandleMenuInput(const String& line)
                     receiveTaskHandle
                 );
             }
-
 
             for (uint16_t i = 0;
                  i < totalPackets;
@@ -1342,15 +2508,22 @@ void HandleMenuInput(const String& line)
                     sizeof(packet.magic)
                 );
 
+                packet.messageID =
+                    messageID;
+
+                packet.senderID =
+                    MY_DEVICE_ID;
+
+                packet.receiverID =
+                    (MY_DEVICE_ID == 1)
+                        ? 2
+                        : 1;
+
                 packet.totalPackets =
                     totalPackets;
 
-                packet.packetIndex = i;
-                packet.messageID = messageID;
-
-                // for to make the receiver ID automatic
-
-                packet.receiverID = (MY_DEVICE_ID == 1) ? 2 : 1;
+                packet.packetIndex =
+                    i;
 
                 int start =
                     i * chunkSize;
@@ -1361,7 +2534,8 @@ void HandleMenuInput(const String& line)
                         totalLen - start
                     );
 
-                packet.payloadLength = len;
+                packet.payloadLength =
+                    len;
 
                 if (len > 0)
                 {
@@ -1375,18 +2549,20 @@ void HandleMenuInput(const String& line)
                 LoRa.beginPacket();
 
                 LoRa.write(
-                    (uint8_t*)&packet,
+                    reinterpret_cast<uint8_t*>(
+                        &packet
+                    ),
                     sizeof(packet)
                 );
 
                 LoRa.endPacket();
 
-                if (i < totalPackets - 1)
+                if (i <
+                    totalPackets - 1)
                 {
-                    delay(25);
+                    delay(100);
                 }
             }
-
 
             if (receiveTaskHandle != NULL)
             {
@@ -1394,7 +2570,6 @@ void HandleMenuInput(const String& line)
                     receiveTaskHandle
                 );
             }
-
 
             currentInput = "";
 
@@ -1407,13 +2582,13 @@ void HandleMenuInput(const String& line)
 
             delay(200);
 
-            appState = AppState::MENU;
+            appState =
+                AppState::MENU;
 
             ShowMenu();
 
             break;
         }
-
 
         // ====================================================
         // CONFIGURE
@@ -1432,7 +2607,8 @@ void HandleMenuInput(const String& line)
 
                 delay(800);
 
-                appState = AppState::MENU;
+                appState =
+                    AppState::MENU;
 
                 currentInput = "";
 
@@ -1451,116 +2627,110 @@ void HandleMenuInput(const String& line)
     }
 }
 
-
 // ============================================================
 // RECEIVE / MESSAGE REASSEMBLY
 // ============================================================
 
 static uint16_t expectedMessageID = 0;
+
 static uint16_t expectedTotalPackets = 0;
+
 static uint16_t fragmentsReceivedCount = 0;
 
 static String fragmentChunks[64];
-static bool fragmentReceived[64] = {false};
 
-static bool messageConstructionActive = false;
+static bool fragmentReceived[64] = {
+    false
+};
 
+static bool messageConstructionActive =
+    false;
 
+// ============================================================
+// RECEIVE TASK
+// ============================================================
 
-void PushRecvdMessage(const String& msg)
-{
-    // Shift older messages down.
-    for (int i = 4; i > 0; i--)
-    {
-        recvdMessages[i] =
-            recvdMessages[i - 1];
-    }
-
-    // Newest message is index 0.
-    recvdMessages[0] = msg;
-
-    if (recvdMessageCount < 5)
-    {
-        recvdMessageCount++;
-    }
-}
-
-void ReceiveTask(void* pvParameters)
+void ReceiveTask(
+    void* pvParameters
+)
 {
     for (;;)
     {
-        // ========================================================
+        // ====================================================
         // Update notification timer
-        // ========================================================
+        // ====================================================
+
         UpdateMessageNotification();
 
-        // ========================================================
-        // Update selected-message scrolling animation
-        // ========================================================
+        // ====================================================
+        // Update selected-message scrolling
+        // ====================================================
+
         UpdateMessageScroll();
 
-        // ========================================================
-        // Check for incoming LoRa packet
-        // ========================================================
-        int packetSize = LoRa.parsePacket();
+        // ====================================================
+        // Check incoming LoRa packet
+        // ====================================================
+
+        int packetSize =
+            LoRa.parsePacket();
 
         if (packetSize > 0)
         {
-            // ----------------------------------------------------
-            // Only accept packets with exactly the expected
-            // LoRaPacket size.
-            // ----------------------------------------------------
-            if (packetSize == sizeof(LoRaPacket))
+            // ------------------------------------------------
+            // Only accept our expected packet size.
+            // ------------------------------------------------
+
+            if (packetSize ==
+                sizeof(LoRaPacket))
             {
                 LoRaPacket packet{};
 
                 int bytesRead =
                     LoRa.readBytes(
-                        (uint8_t*)&packet,
+                        reinterpret_cast<uint8_t*>(
+                            &packet
+                        ),
                         sizeof(packet)
                     );
 
-                // ------------------------------------------------
-                // Make sure the complete structure was received.
-                // ------------------------------------------------
-                if (bytesRead == sizeof(packet))
+                if (bytesRead ==
+                    sizeof(packet))
                 {
-                    // =================================================
+                    // ============================================
                     // CHECK MAGIC
-                    // =================================================
+                    // ============================================
+
                     if (strncmp(
                             packet.magic,
                             "THE GREAT",
                             9
                         ) == 0)
                     {
-                        // =================================================
+                        // ========================================
                         // CHECK RECEIVER ID
-                        //
-                        // Only process packets intended for this
-                        // specific ESP32.
-                        // =================================================
-                        if (packet.receiverID == MY_DEVICE_ID)
+                        // ========================================
+
+                        if (packet.receiverID ==
+                            MY_DEVICE_ID)
                         {
-                            // =================================================
+                            // ====================================
                             // VALIDATE PACKET
-                            // =================================================
-                            if (packet.totalPackets > 0 &&
+                            // ====================================
+
+                            if (
+                                packet.totalPackets > 0 &&
                                 packet.totalPackets <= 64 &&
                                 packet.packetIndex <
                                     packet.totalPackets &&
                                 packet.payloadLength <=
-                                    sizeof(packet.payload))
+                                    sizeof(packet.payload)
+                            )
                             {
-                                // =================================================
+                                // =================================
                                 // START NEW MESSAGE CONSTRUCTION
-                                //
-                                // The first valid packet we receive becomes
-                                // the message currently being constructed.
-                                //
-                                // It does NOT have to be packetIndex == 0.
-                                // Therefore packets can arrive out of order.
-                                // =================================================
+                                // =================================
+
                                 if (!messageConstructionActive)
                                 {
                                     expectedMessageID =
@@ -1569,9 +2739,9 @@ void ReceiveTask(void* pvParameters)
                                     expectedTotalPackets =
                                         packet.totalPackets;
 
-                                    fragmentsReceivedCount = 0;
+                                    fragmentsReceivedCount =
+                                        0;
 
-                                    // Clear previous construction data.
                                     for (int i = 0;
                                          i < 64;
                                          i++)
@@ -1587,41 +2757,36 @@ void ReceiveTask(void* pvParameters)
                                         true;
                                 }
 
-                                // =================================================
+                                // =================================
                                 // CHECK MESSAGE ID
-                                //
-                                // The packet must belong to the message that
-                                // is currently being reconstructed.
-                                // =================================================
+                                // =================================
+
                                 if (packet.messageID ==
                                     expectedMessageID)
                                 {
-                                    // =================================================
+                                    // =============================
                                     // CHECK TOTAL PACKET COUNT
-                                    //
-                                    // Prevent packets from another message
-                                    // with the same message ID but a different
-                                    // packet count from being mixed in.
-                                    // =================================================
+                                    // =============================
+
                                     if (packet.totalPackets ==
                                         expectedTotalPackets)
                                     {
-                                        // =============================================
-                                        // STORE FRAGMENT ONLY ONCE
-                                        // =============================================
+                                        // =========================
+                                        // STORE FRAGMENT ONCE
+                                        // =========================
+
                                         if (!fragmentReceived[
                                                 packet.packetIndex])
                                         {
-                                            String fragment = "";
+                                            String fragment =
+                                                "";
 
-                                            // -----------------------------------------
-                                            // Copy exactly payloadLength characters.
-                                            // Do not depend on null termination.
-                                            // -----------------------------------------
-                                            for (uint8_t i = 0;
-                                                 i <
-                                                 packet.payloadLength;
-                                                 i++)
+                                            for (
+                                                uint8_t i = 0;
+                                                i <
+                                                packet.payloadLength;
+                                                i++
+                                            )
                                             {
                                                 fragment +=
                                                     packet.payload[i];
@@ -1629,58 +2794,87 @@ void ReceiveTask(void* pvParameters)
 
                                             fragmentChunks[
                                                 packet.packetIndex
-                                            ] = fragment;
+                                            ] =
+                                                fragment;
 
                                             fragmentReceived[
                                                 packet.packetIndex
-                                            ] = true;
+                                            ] =
+                                                true;
 
                                             fragmentsReceivedCount++;
                                         }
 
-                                        // =============================================
-                                        // CHECK FOR COMPLETE MESSAGE
-                                        // =============================================
-                                        if (fragmentsReceivedCount ==
-                                            expectedTotalPackets)
-                                        {
-                                            String fullMessage = "";
+                                        // =========================
+                                        // CHECK COMPLETE MESSAGE
+                                        // =========================
 
-                                            // -----------------------------------------
-                                            // Reconstruct message in packet order.
-                                            // -----------------------------------------
-                                            for (uint16_t i = 0;
-                                                 i <
-                                                 expectedTotalPackets;
-                                                 i++)
+                                        if (
+                                            fragmentsReceivedCount ==
+                                            expectedTotalPackets
+                                        )
+                                        {
+                                            String fullMessage =
+                                                "";
+
+                                            // ---------------------
+                                            // Reconstruct in order.
+                                            // ---------------------
+
+                                            for (
+                                                uint16_t i = 0;
+                                                i <
+                                                expectedTotalPackets;
+                                                i++
+                                            )
                                             {
                                                 fullMessage +=
                                                     fragmentChunks[i];
                                             }
 
-                                            // -----------------------------------------
-                                            // Store completed message.
-                                            // -----------------------------------------
-                                            PushRecvdMessage(
-                                                fullMessage
-                                            );
+                                            // ---------------------
+                                            // IMPORTANT:
+                                            //
+                                            // Save to LittleFS first.
+                                            // Only show "Message
+                                            // Received" if storage
+                                            // succeeded.
+                                            // ---------------------
 
-                                            // -----------------------------------------
-                                            // Show "Message Received".
-                                            // -----------------------------------------
-                                            StartMessageNotification();
+                                            if (SaveReceivedMessage(
+                                                    fullMessage
+                                                ))
+                                            {
+                                                StartMessageNotification();
+                                            }
+                                            else
+                                            {
+                                                Serial.println(
+                                                    "ERROR: Failed to save received message."
+                                                );
+                                            }
 
-                                            // =========================================
-                                            // RESET MESSAGE CONSTRUCTION STATE
-                                            // =========================================
+                                            isThereNewMessage = true;
+                                            prefs.begin("MsgNot", false);
+                                            prefs.putBool("isNewMsg", true);
+                                            prefs.end();
+                                            digitalWrite(13, HIGH);
+
+                                            // =====================
+                                            // RESET CONSTRUCTION
+                                            // =====================
+
                                             messageConstructionActive =
                                                 false;
 
-                                            expectedMessageID = 0;
+                                            expectedMessageID =
+                                                0;
 
-                                            expectedTotalPackets = 0;
+                                            expectedTotalPackets =
+                                                0;
 
-                                            fragmentsReceivedCount = 0;
+                                            fragmentsReceivedCount =
+                                                0;
 
                                             for (int i = 0;
                                                  i < 64;
@@ -1702,10 +2896,11 @@ void ReceiveTask(void* pvParameters)
             }
             else
             {
-                // ----------------------------------------------------
-                // Packet is not our expected structure size.
-                // Discard any remaining bytes from this packet.
-                // ----------------------------------------------------
+                // ------------------------------------------------
+                // Wrong packet size.
+                // Discard remaining bytes.
+                // ------------------------------------------------
+
                 while (LoRa.available())
                 {
                     LoRa.read();
@@ -1713,179 +2908,12 @@ void ReceiveTask(void* pvParameters)
             }
         }
 
-        // ========================================================
-        // Keep task from running continuously at full CPU speed.
-        // ========================================================
+        // ====================================================
+        // Prevent continuous full-speed execution.
+        // ====================================================
+
         vTaskDelay(
-            pdMS_TO_TICKS(1)
+            pdMS_TO_TICKS(0)
         );
     }
 }
-
-// void ReceiveTask(void* pvParameters)
-// {
-//     for (;;)
-//     {
-//         // Notification timer.
-//         UpdateMessageNotification();
-
-//         // Selected-message scrolling animation.
-//         UpdateMessageScroll();
-
-
-//         int packetSize =
-//             LoRa.parsePacket();
-
-
-//         if (packetSize > 0)
-//         {
-//             LoRaPacket packet{};
-
-//             int bytesRead =
-//                 LoRa.readBytes(
-//                     (uint8_t*)&packet,
-//                     sizeof(packet)
-//                 );
-
-
-//             if (bytesRead == sizeof(packet))
-//             {
-//                 // ------------------------------------------------
-//                 // Check magic
-//                 // ------------------------------------------------
-
-//                 if (strncmp(
-//                         packet.magic,
-//                         "THE GREAT",
-//                         9
-//                     ) == 0)
-//                 {
-//                     if (packet.receiverID != MY_DEVICE_ID) {
-//                         continue;
-//                     }
-//                     // ------------------------------------------------
-//                     // Validate packet
-//                     // ------------------------------------------------
-
-//                     if (packet.totalPackets > 0 &&
-//                         packet.totalPackets <= 64 &&
-//                         packet.packetIndex < packet.totalPackets &&
-//                         packet.payloadLength <=
-//                             sizeof(packet.payload))
-//                     {
-//                         // ------------------------------------------------
-//                         // New message
-//                         // ------------------------------------------------
-
-//                         if (packet.packetIndex == 0)
-//                         {
-//                             expectedTotalPackets =
-//                                 packet.totalPackets;
-
-//                             fragmentsReceivedCount = 0;
-
-//                             for (int i = 0;
-//                                  i < 64;
-//                                  i++)
-//                             {
-//                                 fragmentReceived[i] =
-//                                     false;
-
-//                                 fragmentChunks[i] =
-//                                     "";
-//                             }
-//                         }
-
-
-//                         // ------------------------------------------------
-//                         // Only accept packets belonging to current
-//                         // message.
-//                         // ------------------------------------------------
-
-//                         if (packet.totalPackets ==
-//                             expectedTotalPackets)
-//                         {
-//                             // --------------------------------------------
-//                             // Store fragment only once.
-//                             // --------------------------------------------
-
-//                             if (!fragmentReceived[
-//                                     packet.packetIndex])
-//                             {
-//                                 String fragment = "";
-
-//                                 for (uint8_t i = 0;
-//                                      i < packet.payloadLength;
-//                                      i++)
-//                                 {
-//                                     fragment +=
-//                                         packet.payload[i];
-//                                 }
-
-//                                 fragmentChunks[
-//                                     packet.packetIndex
-//                                 ] = fragment;
-
-//                                 fragmentReceived[
-//                                     packet.packetIndex
-//                                 ] = true;
-
-//                                 fragmentsReceivedCount++;
-//                             }
-
-
-//                             // --------------------------------------------
-//                             // Complete message
-//                             // --------------------------------------------
-
-//                             if (fragmentsReceivedCount ==
-//                                 expectedTotalPackets)
-//                             {
-//                                 String fullMessage = "";
-
-//                                 for (uint16_t i = 0;
-//                                      i < expectedTotalPackets;
-//                                      i++)
-//                                 {
-//                                     fullMessage +=
-//                                         fragmentChunks[i];
-//                                 }
-
-
-//                                 PushRecvdMessage(
-//                                     fullMessage
-//                                 );
-
-
-//                                 StartMessageNotification();
-
-
-//                                 expectedTotalPackets = 0;
-
-//                                 fragmentsReceivedCount = 0;
-
-
-//                                 for (int i = 0;
-//                                      i < 64;
-//                                      i++)
-//                                 {
-//                                     fragmentReceived[i] =
-//                                         false;
-
-//                                     fragmentChunks[i] =
-//                                         "";
-//                                 }
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-
-
-//         // MUST remain inside the loop.
-//         vTaskDelay(
-//             pdMS_TO_TICKS(1)
-//         );
-//     }
-// }
