@@ -1505,6 +1505,11 @@ static String GetMessagePreview(
 
 void ShowMessagePage()
 {
+    isThereNewMessage = false;
+    prefs.begin("MsgNot", false);
+    prefs.putBool("isNewMsg", false);
+    prefs.end();
+    digitalWrite(13, LOW);
     size_t messageCount =
         GetStoredMessageCount();
 
@@ -2090,11 +2095,7 @@ void HandleMenuInput(
 
                 ShowMessagePage();
 
-                isThereNewMessage = false;
-                prefs.begin("MsgNot", false);
-                prefs.putBool("isNewMsg", false);
-                prefs.end();
-                digitalWrite(13, LOW);
+                
             }
 
             else if (line == "2")
