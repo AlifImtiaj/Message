@@ -22,6 +22,8 @@ LiquidCrystal_I2C display(
     ROW
 );
 
+void playStartupAnimation4(LiquidCrystal_I2C &lcd);
+
 
 void setup()
 {
@@ -228,7 +230,7 @@ void setup()
     // ========================================================
     // Start application
     // ========================================================
-
+    playStartupAnimation4(display);
     ShowMenu();
 
     xTaskCreate(
@@ -252,4 +254,143 @@ void loop()
     HandleMenuInput(
         line
     );
+}
+
+void playStartupAnimation4(LiquidCrystal_I2C &lcd) {
+  // CGRAM slots 0-3: bar shade levels (dim fill -> bright leading edge)
+  static byte shade1[8] = {0b00000,0b00000,0b01010,0b00000,0b00000,0b01010,0b00000,0b00000}; // sparse dither
+  static byte shade2[8] = {0b10101,0b01010,0b10101,0b01010,0b10101,0b01010,0b10101,0b01010}; // medium dither
+  static byte shadeFull[8]={0b11111,0b11111,0b11111,0b11111,0b11111,0b11111,0b11111,0b11111}; // solid
+  static byte shadeEdge[8]={0b11111,0b11111,0b01110,0b01110,0b01110,0b01110,0b11111,0b11111}; // bright glowing tip
+ 
+  lcd.createChar(0, shade1);
+  lcd.createChar(1, shade2);
+  lcd.createChar(2, shadeFull);
+  lcd.createChar(3, shadeEdge);
+ 
+  const uint8_t COLS = 20;
+  const unsigned long ANIM_DURATION_MS = 4000;
+  const unsigned long FRAME_INTERVAL_MS = 40; // ~25fps cap
+ 
+  const char* DEVICE_TITLE = " LoRa NODE ";
+  const char* logLines[] = {
+    "Init radio module",
+    "Loading config",
+    "Calibrating sensor",
+    "Starting mesh link"
+  };
+  const uint8_t NUM_LOGS = 4;
+ 
+  lcd.clear();
+ 
+  // --- Static border, drawn once ---
+  lcd.setCursor(0, 0);
+  lcd.print("+------------------+");
+  lcd.setCursor(0, 3);
+  lcd.print("+------------------+");
+  lcd.setCursor(1, 0);
+  lcd.print(DEVICE_TITLE);
+  lcd.setCursor(0, 1);
+  lcd.print("|");
+  lcd.setCursor(19, 1);
+  lcd.print("|");
+  lcd.setCursor(0, 2);
+  lcd.print("|");
+  lcd.setCursor(19, 2);
+  lcd.print("|");
+ 
+  const uint8_t BAR_COL_START = 1;
+  const uint8_t BAR_WIDTH = 18;
+  const uint8_t BAR_ROW = 2;
+ 
+  unsigned long startTime = millis();
+  unsigned long lastFrameTime = 0;
+  int8_t lastLogIndex = -1;
+  uint8_t lastRevealCount = 0;
+  int lastPercent = -1;
+ 
+  while (true) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - startTime;
+    if (elapsed >= ANIM_DURATION_MS) break;
+ 
+    if (now - lastFrameTime < FRAME_INTERVAL_MS) continue;
+    lastFrameTime = now;
+ 
+    float progress = (float)elapsed / (float)ANIM_DURATION_MS;
+ 
+    // --- Boot log: cycle through log lines, each "typing in" over its time slice ---
+    float logSlice = 1.0f / NUM_LOGS;
+    uint8_t logIndex = (uint8_t)(progress / logSlice);
+    if (logIndex >= NUM_LOGS) logIndex = NUM_LOGS - 1;
+    float logLocalProgress = (progress - logIndex * logSlice) / logSlice;
+    uint8_t lineLen = strlen(logLines[logIndex]);
+    uint8_t revealCount = (uint8_t)(logLocalProgress * (lineLen + 3)); // +3 gives a brief pause after full reveal
+    if (revealCount > lineLen) revealCount = lineLen;
+ 
+    if (logIndex != lastLogIndex) {
+      lcd.setCursor(1, 1);
+      lcd.print("                  "); // clear line (18 spaces, inside border)
+      lastRevealCount = 0;
+      lastLogIndex = logIndex;
+    }
+    if (revealCount != lastRevealCount) {
+      lcd.setCursor(1, 1);
+      for (uint8_t i = 0; i < revealCount; i++) {
+        lcd.print(logLines[logIndex][i]);
+      }
+      // blinking cursor block at the typing position
+      if (revealCount < lineLen) {
+        lcd.write((uint8_t)2);
+      }
+      lastRevealCount = revealCount;
+    }
+ 
+    // --- Progress bar with glowing leading edge ---
+    float filledUnitsF = progress * BAR_WIDTH;
+    uint8_t fullCells = (uint8_t)filledUnitsF;
+    if (fullCells > BAR_WIDTH) fullCells = BAR_WIDTH;
+ 
+    for (uint8_t i = 0; i < BAR_WIDTH; i++) {
+      lcd.setCursor(BAR_COL_START + i, BAR_ROW);
+      if (i < fullCells) {
+        lcd.write((uint8_t)2); // solid fill
+      } else if (i == fullCells) {
+        lcd.write((uint8_t)3); // glowing edge at the leading tip
+      } else if (i == fullCells + 1) {
+        lcd.write((uint8_t)1); // medium dither just ahead
+      } else if (i == fullCells + 2) {
+        lcd.write((uint8_t)0); // sparse dither further ahead
+      } else {
+        lcd.print(' ');
+      }
+    }
+ 
+    // --- Percentage counter, printed on row 0 right side inside border ---
+    int percent = (int)(progress * 100);
+    if (percent != lastPercent) {
+      lcd.setCursor(15, 0);
+      char buf[5];
+      sprintf(buf, "%3d%%", percent);
+      lcd.print(buf);
+      lastPercent = percent;
+    }
+  }
+ 
+  // --- Final state: full bar, 100%, then READY flash ---
+  for (uint8_t i = 0; i < BAR_WIDTH; i++) {
+    lcd.setCursor(BAR_COL_START + i, BAR_ROW);
+    lcd.write((uint8_t)2);
+  }
+  lcd.setCursor(15, 0);
+  lcd.print("100%");
+  lcd.setCursor(1, 1);
+  lcd.print("                  ");
+ 
+  delay(200);
+  lcd.setCursor(7, 1);
+  lcd.print("READY");
+  delay(500);
+ 
+  lcd.clear();
 }
