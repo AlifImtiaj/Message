@@ -11,6 +11,10 @@ void SetTransmissionPower()
 {
     LcdPrint(0, 0, "Enter TX Power", true);
     LcdPrint(0, 1, "Range: 2-20 dBm");
+    String currentValue = "Current: ";
+    currentValue += loraConfig.transmissionPower;
+    currentValue += " dBm";
+    LcdPrint(0,2, currentValue);
     LcdPrint(0, 3, "Option: ");
     SetInputPosition(8, 3);
 
@@ -67,6 +71,9 @@ void SetSpreadingFactor()
 {
     LcdPrint(0, 0, "Enter Spreading", true);
     LcdPrint(0, 1, "Factor. Range:7-12");
+    String currentValue = "Current: SF";
+    currentValue += loraConfig.spreadingFactor; 
+    LcdPrint(0,2, currentValue);
     LcdPrint(0, 3, "Option: ");
     SetInputPosition(8, 3);
 
@@ -118,6 +125,10 @@ void SetBandwidth()
 {
     LcdPrint(0, 0, "Enter Bandwidth Hz", true);
     LcdPrint(0, 1, "See Serial Monitor");
+    String currentValue = "Current: ";
+    currentValue += loraConfig.bandwidth;
+    currentValue += " Hz";
+    LcdPrint(0,2, currentValue);
     LcdPrint(0, 3, "Option: ");
     SetInputPosition(8, 3);
 
