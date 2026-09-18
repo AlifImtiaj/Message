@@ -6,6 +6,7 @@
 #include <Preferences.h>
 
 #include "LoraConfig.h"
+#include "debug.h"
 
 #define ROW 4
 #define COL 20
@@ -1141,6 +1142,10 @@ void RestorePreviousScreen()
                 "Enter message:",
                 true
             );
+            LcdPrint(
+                0,2,
+                "Press Enter to Send"
+            );
 
             RedrawScrollingInput(
                 notificationPreviousInput,
@@ -2106,6 +2111,8 @@ void HandleMenuInput(
                     true
                 );
 
+                LcdPrint(0, 2, "Press Enter to Send");
+
                 SetInputPosition(
                     0,
                     1
@@ -2124,23 +2131,27 @@ void HandleMenuInput(
                     );
                 }
 
-                LcdPrint(
-                    0,
-                    0,
-                    "Configuring...",
-                    true
-                );
+                /*
+                * Configuration codes
+                */
 
-                LcdPrint(
-                    0,
-                    1,
-                    "Check Serial Monitor"
-                );
+                // LcdPrint(
+                //     0,
+                //     0,
+                //     "Configuring...",
+                //     true
+                // );
 
-                SetInputPosition(
-                    0,
-                    2
-                );
+                // LcdPrint(
+                //     0,
+                //     1,
+                //     "Check Serial Monitor"
+                // );
+
+                // SetInputPosition(
+                //     0,
+                //     2
+                // );
 
                 ConfigureLoRa();
             }
@@ -2507,13 +2518,15 @@ void HandleMenuInput(
                     "THE GREAT",
                     sizeof(packet.magic)
                 );
-
+                // set the message ID
                 packet.messageID =
                     messageID;
 
+                // set the sender id 
                 packet.senderID =
                     MY_DEVICE_ID;
 
+                // set the receiver id, in this case, there is only 2 device. so no big issue
                 packet.receiverID =
                     (MY_DEVICE_ID == 1)
                         ? 2
@@ -2555,6 +2568,36 @@ void HandleMenuInput(
                     sizeof(packet)
                 );
 
+                #ifdef DEBUG_BUILD
+                Serial.println("========================================");
+                Serial.println("TX PACKET");
+
+                Serial.print("Size = ");
+                Serial.print(sizeof(LoRaPacket));
+                Serial.println();
+
+                Serial.print("TX RAW: ");
+
+                const uint8_t *raw = reinterpret_cast<const uint8_t *>(&packet);
+
+                for (size_t i = 0; i < sizeof(LoRaPacket); i++)
+                {
+                    if (raw[i] < 0x10)
+                        Serial.print('0');
+
+                    Serial.print(raw[i], HEX);
+                    Serial.print(' ');
+
+                    if ((i + 1) % 16 == 0)
+                        Serial.println();
+                }
+
+                Serial.println();
+                Serial.println("========================================");
+                #else
+
+                #endif
+
                 LoRa.endPacket();
 
                 if (i <
@@ -2580,7 +2623,7 @@ void HandleMenuInput(
                 true
             );
 
-            delay(200);
+            delay(800);
 
             appState =
                 AppState::MENU;
@@ -2596,7 +2639,7 @@ void HandleMenuInput(
 
         case AppState::CONFIGURE:
         {
-            if (line == "done")
+            if (line == "done" || line == "0")
             {
                 LcdPrint(
                     0,
@@ -2620,7 +2663,47 @@ void HandleMenuInput(
                 }
 
                 ShowMenu();
+
+                break;
             }
+
+            if (line == "1")
+            {
+                currentInput = "";
+                SetSpreadingFactor();
+                break;
+            }
+
+            if (line == "2")
+            {
+                currentInput = "";
+                SetBandwidth();
+                break;
+            }
+
+            if (line == "3")
+            {
+                currentInput = "";
+                SetTransmissionPower();
+                break;
+            }
+
+            // ------------------------------------------------
+            // INVALID OPTION
+            // ------------------------------------------------
+
+            LcdPrint(
+                0,
+                0,
+                "Invalid Option",
+                true
+            );
+
+            delay(800);
+
+            currentInput = "";
+
+            ConfigureLoRa();
 
             break;
         }
@@ -2677,6 +2760,14 @@ void ReceiveTask(
 
         if (packetSize > 0)
         {
+
+            // debug code on why this is not receiving packet on higher SF
+            DEBUG_PRINT("LoRa packet detected. Size = ");
+            DEBUG_PRINT(packetSize);
+            DEBUG_PRINT(" / Expected = ");
+            DEBUG_PRINTLN(sizeof(LoRaPacket));
+            // debug code ends here
+
             // ------------------------------------------------
             // Only accept our expected packet size.
             // ------------------------------------------------
@@ -2693,6 +2784,34 @@ void ReceiveTask(
                         ),
                         sizeof(packet)
                     );
+                DEBUG_PRINTF(
+                "RX: ID=%u From=%u To=%u Fragment=%u/%u Len=%u RSSI=%d SNR=%.1f\n",
+                    packet.messageID,
+                    packet.senderID,
+                    packet.receiverID,
+                    packet.packetIndex + 1,
+                    packet.totalPackets,
+                    packet.payloadLength,
+                    LoRa.packetRssi(),
+                    LoRa.packetSnr()
+                );
+                DEBUG_PRINTF(
+                    "Bytes read = %d / Expected = %d\n",
+                    bytesRead,
+                    sizeof(packet)
+                );
+
+                DEBUG_PRINT("RAW: ");
+
+                for (int i = 0; i < 30; i++)
+                {
+                    DEBUG_PRINTF(
+                        "%02X ",
+                        reinterpret_cast<uint8_t*>(&packet)[i]
+                    );
+                }
+
+                DEBUG_PRINTLN();
 
                 if (bytesRead ==
                     sizeof(packet))
@@ -2896,6 +3015,10 @@ void ReceiveTask(
             }
             else
             {
+                // debug code
+                DEBUG_PRINTLN("ERROR: Packet size mismatch!");
+                // debug code end
+
                 // ------------------------------------------------
                 // Wrong packet size.
                 // Discard remaining bytes.

@@ -9,6 +9,7 @@
 
 #include "LoraConfig.h"
 #include "AppState.h"
+#include "debug.h"
 
 #define ROW 4
 #define COL 20
@@ -84,6 +85,40 @@ void setup()
         isThereNewMessage = prefs.getBool("isNewMsg");
     prefs.end();
 
+    prefs.begin("config", false);
+    if (!prefs.isKey("txPower")) {
+        prefs.putInt("txPower", loraConfig.transmissionPower);
+        DEBUG_PRINT("TxPower set: ");
+        DEBUG_PRINTLN(loraConfig.transmissionPower);
+    }
+    else {
+        loraConfig.transmissionPower = prefs.getInt("txPower", 17);
+        DEBUG_PRINT("TxPower get: ");
+        DEBUG_PRINTLN(loraConfig.transmissionPower);
+    }
+    if (!prefs.isKey("sf")) {
+        prefs.putInt("sf", loraConfig.spreadingFactor);
+        DEBUG_PRINT("Spreading Factor set: ");
+        DEBUG_PRINTLN(loraConfig.spreadingFactor);
+
+    }
+    else {
+        loraConfig.spreadingFactor = prefs.getInt("sf", 8);
+        DEBUG_PRINT("Spreading Factor get: ");
+        DEBUG_PRINTLN(loraConfig.spreadingFactor);
+    }
+    if (!prefs.isKey("bdwidth")) {
+        prefs.putLong("bdwidth", loraConfig.bandwidth);
+        DEBUG_PRINT("Bandwidth set: ");
+        DEBUG_PRINTLN(loraConfig.bandwidth);
+    }
+    else {
+        loraConfig.bandwidth = prefs.getLong("bdwidth", 125E3);
+        DEBUG_PRINT("Bandwidth get: ");
+        DEBUG_PRINTLN(loraConfig.bandwidth);
+    }
+    prefs.end();
+
     pinMode(
         LED_PIN,
         OUTPUT
@@ -108,6 +143,32 @@ void setup()
     LoRa.setSignalBandwidth(
         loraConfig.bandwidth
     );
+
+    // debug print lines
+    DEBUG_PRINTLN();
+    DEBUG_PRINTLN("========== LORA CONFIG ==========");
+
+    DEBUG_PRINT("Frequency: ");
+    DEBUG_PRINTLN(433E6);
+
+    DEBUG_PRINT("TX Power: ");
+    DEBUG_PRINT(loraConfig.transmissionPower);
+    DEBUG_PRINTLN(" dBm");
+
+    DEBUG_PRINT("SF: ");
+    DEBUG_PRINTLN(loraConfig.spreadingFactor);
+
+    DEBUG_PRINT("Bandwidth: ");
+    DEBUG_PRINTLN(loraConfig.bandwidth);
+
+    DEBUG_PRINT("Coding Rate: 4/");
+    DEBUG_PRINTLN(loraConfig.codingRate);
+
+    DEBUG_PRINT("Packet size: ");
+    DEBUG_PRINTLN(sizeof(LoRaPacket));
+
+    DEBUG_PRINTLN("=================================");
+    // debug ends here
 
     // ========================================================
     // Display mutex
@@ -139,22 +200,22 @@ void setup()
     // ========================================================
 
     if (!InitializeMessageStorage())
-{
-    Serial.println("================================");
-    Serial.println("LittleFS INITIALIZATION FAILED");
-    Serial.println("================================");
-    
-    display.clear();
-    display.setCursor(0, 0);
-    display.print("LittleFS FAILED");
-    display.setCursor(0, 1);
-    display.print("See Serial Monitor");
-
-    while (true)
     {
-        delay(1000);
+        Serial.println("================================");
+        Serial.println("LittleFS INITIALIZATION FAILED");
+        Serial.println("================================");
+        
+        display.clear();
+        display.setCursor(0, 0);
+        display.print("LittleFS FAILED");
+        display.setCursor(0, 1);
+        display.print("See Serial Monitor");
+
+        while (true)
+        {
+            delay(1000);
+        }
     }
-}
 
 // if (LittleFS.exists("/messages.dat"))
 // {
